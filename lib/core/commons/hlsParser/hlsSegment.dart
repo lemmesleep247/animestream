@@ -5,4 +5,5 @@ class HlsSegment({
   required final double duration,
   required final int sequenceNumber,
   required final HlsEncryptionKey? encryptionKey,
+  final String? initUrl,
 });

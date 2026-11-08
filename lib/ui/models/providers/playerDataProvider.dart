@@ -90,7 +90,7 @@ class PlayerDataProvider extends ChangeNotifier {
     }
 
     String? mime;
-    if (!url.contains(RegExp(r'\.(mkv|mp4|mov|webm|dash|m3u|m3u8)', caseSensitive: false))) {
+    if (!url.contains(RegExp(r'\.(mkv|mp4|mov|webm|dash|mpd|m3u|m3u8)', caseSensitive: false))) {
       //get mime if none is mentioned
       mime = await getMediaMimeType(url, headers);
       print(mime);

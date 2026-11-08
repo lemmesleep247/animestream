@@ -129,6 +129,8 @@ class HlsParser {
     final res = await http.get(baseUri, headers: customHeaders);
     final lines = res.body.split('\n');
 
+    String? initUrl;
+
     int sequenceNumber = 0;
     double duration = 0.0;
     HlsEncryptionKey? currentKey;
