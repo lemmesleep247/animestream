@@ -37,16 +37,23 @@ class CacheManager {
     required CacheStorage storage,
     CacheConfig? cacheConfig,
   }) : _storage = storage,
-       _customConfig = cacheConfig {
-    _initCleanup();
-  }
+       _customConfig = cacheConfig;
 
   CacheConfig get cacheConfig =>
       _customConfig ?? CacheConfigController.instance.value;
 
+  // Storage is opened lazily on first use, so merely constructing a CacheManager
+  // (e.g. via the HTTP client in an isolate without Hive) has no side effects.
+  Future<void>? _ready;
+  Future<void> _ensureReady() => _ready ??= _initCleanup().catchError((Object e) {
+    _ready = null; // allow a retry on the next access
+    throw e;
+  });
+
+  // Must not call public methods: they await [_ensureReady], which is this very future.
   Future<void> _initCleanup() async {
     await _storage.init();
-    await clearExpired();
+    await _clearExpired();
     await _enforceMaxCacheSize();
   }
 
@@ -54,7 +61,7 @@ class CacheManager {
     final log = _log.child('enforceMaxCacheSize');
     try {
       final maxSize = cacheConfig.maxCacheSize;
-      final currentSize = await getCacheSize();
+      final currentSize = await _storage.getCacheSize();
       if (currentSize <= maxSize) {
         return;
       }
@@ -88,6 +95,7 @@ class CacheManager {
     final log = _log.child('get');
 
     try {
+      await _ensureReady();
       final entry = await _storage.get(key);
 
       if (entry == null) {
@@ -113,6 +121,7 @@ class CacheManager {
     final log = _log.child('put');
 
     try {
+      await _ensureReady();
       entry.key = key;
       entry.expiry = DateTime.now().add(cacheDuration);
 
@@ -128,6 +137,7 @@ class CacheManager {
     final log = _log.child('delete');
 
     try {
+      await _ensureReady();
       await _storage.delete(key);
       log.s('DELETED: $key');
     } catch (e, st) {
@@ -136,6 +146,16 @@ class CacheManager {
   }
 
   Future<void> clearExpired() async {
+    try {
+      await _ensureReady();
+    } catch (e, st) {
+      _log.child('clearExpired').e('CLEANUP FAILED', e, st);
+      return;
+    }
+    await _clearExpired();
+  }
+
+  Future<void> _clearExpired() async {
     final log = _log.child('clearExpired');
 
     try {
@@ -152,6 +172,7 @@ class CacheManager {
     final log = _log.child('getCacheSize');
 
     try {
+      await _ensureReady();
       return await _storage.getCacheSize();
     } catch (e, st) {
       log.e('SIZE FAILED', e, st);
@@ -164,6 +185,7 @@ class CacheManager {
 
     try {
       log.w('Clearing cache');
+      await _ensureReady();
       await _storage.clear();
       log.s('Cache cleared');
     } catch (e, st) {
@@ -174,6 +196,7 @@ class CacheManager {
   Future<List<CacheEntry>> getAllEntries() async {
     final log = _log.child('getAllEntries');
     try {
+      await _ensureReady();
       return await _storage.getAll();
     } catch (e, st) {
       log.e('GET ALL ENTRIES FAILED', e, st);

@@ -1,21 +1,21 @@
 import 'dart:async';
-import 'dart:collection';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:animestream/core/commons/streams/mediaSegment.dart';
+import 'package:animestream/core/commons/streams/streamRef.dart';
 import 'package:animestream/core/downloader/downloaders/baseDownloader.dart';
 import 'package:animestream/core/downloader/models.dart';
 import 'package:animestream/core/commons/extensions.dart';
-import 'package:animestream/core/commons/hlsParser/hlsParser.dart';
-import 'package:animestream/core/commons/hlsParser/hlsSegment.dart';
 import 'package:animestream/core/remuxer/remuxer.dart';
-import 'package:encrypt/encrypt.dart';
 import 'package:http/http.dart';
 
+/// Downloads segmented streams (HLS or DASH, TS or fMP4) via their [StreamRef]s.
 class StreamDownloader extends BaseDownloader {
   StreamDownloader(DownloadTaskIsolate task) : super(task);
 
-  final _encryptionKeyCache = <String, Uint8List>{};
+  BaseMkvRemuxer? _remuxer;
+  IOSink? _out;
 
   @override
   Future<void> download() async {
@@ -28,83 +28,94 @@ class StreamDownloader extends BaseDownloader {
     );
 
     File? output;
-    TsToMkvRemuxer? remuxed;
-
-    final hasAudio = task.audioStreams.isNotEmpty;
-
-    if (task.useMkvRemuxer) {
-      remuxed = TsToMkvRemuxer(
-        finalPath,
-        hasSeparateAudio: hasAudio,
-        audioLanguage: task.audioStreams.firstOrNull?.language,
-        audioTrackName: task.audioStreams.firstOrNull?.name,
-      );
-    } else {
-      output = File(finalPath);
-    }
-
-    // Download subtitles if available
-    if (task.subsUrl != null) {
-      final downloadedSubsPath = await downloadSubs(task.subsUrl!, task.fileName, finalPath);
-      if (task.writeSubtitleTrackToVideo && remuxed != null) {
-        final ext = downloadedSubsPath.split(".").lastOrNull?.toLowerCase();
-        if (ext == "srt" || ext == "vtt") {
-          await remuxed.loadSubtitles(downloadedSubsPath);
-        } else {
-          task.sendPort?.send(
-            DownloadMessage(
-              status: 'error',
-              id: task.id,
-              message:
-                  "Cannot write subtitles to the video file. Only SRT and VTT subtitles are supported by the remuxer.",
-              extras: ["No stack trace needed btw... maybe.. the extension we got is: '$ext'"],
-            ),
-          );
-        }
-      }
-    }
-
-    // open the write mode
-    final out = await output?.openWrite(mode: task.resumeFrom == 0 ? FileMode.write : FileMode.append);
 
     try {
-      final streamBaseLink = helper.makeBaseLink(task.url);
-      final audioBaseLink = hasAudio ? helper.makeBaseLink(task.audioStreams.first.url) : "";
-      final segments = await HlsParser.parseSegments(task.url, customHeaders: task.customHeaders);
-      final List<HlsSegment> audioSegements = task.audioStreams.isNotEmpty
-          ? await HlsParser.parseSegments(task.audioStreams.first.url, customHeaders: task.customHeaders)
-          : [];
+      final videoRef = task.videoStream?.ref ?? HlsRef(task.url);
+      final audioRef = task.audioStreams.firstOrNull?.ref;
 
-      final parallelDownloadsBatchSize = task.parallelBatches;
+      final video = _Track(
+        "video",
+        await videoRef.segments(headers: task.customHeaders),
+        maxParallel: task.parallelBatches,
+        startAt: task.resumeFrom,
+      );
+      final audio = _Track("audio", await audioRef?.segments(headers: task.customHeaders) ?? const [], maxParallel: 2);
+      final hasAudio = audio.segments.isNotEmpty;
 
+      final protocol = switch (videoRef) {
+        HlsRef() => "HLS (m3u8)",
+        DashRef() => "DASH (mpd)",
+      };
+      log(
+        "Stream: $protocol | video: ${_describeTrack(video.segments)}"
+        "${hasAudio ? " | audio: ${_describeTrack(audio.segments)}" : " | audio: muxed in video"}"
+        " | output: ${task.useMkvRemuxer ? "mkv (remuxed)" : "mp4 (raw concat)"}"
+        "${task.resumeFrom > 0 ? " | resuming from segment ${task.resumeFrom}" : ""}",
+      );
+
+      if (hasAudio && !task.useMkvRemuxer) {
+        throw Exception("Separate audio tracks can only be downloaded with the MKV remuxer enabled.");
+      }
+
+      if (task.useMkvRemuxer) {
+        // Init segments mean fragmented MP4 (DASH, or HLS with #EXT-X-MAP), otherwise MPEG-TS
+        final isFragmented = video.segments.any((s) => s.isInit) || audio.segments.any((s) => s.isInit);
+        final audioInfo = task.audioStreams.firstOrNull;
+        _remuxer = isFragmented
+            ? M4sToMkvRemuxer(
+                finalPath,
+                hasSeparateAudio: hasAudio,
+                audioLanguage: audioInfo?.language,
+                audioTrackName: audioInfo?.name,
+              )
+            : TsToMkvRemuxer(
+                finalPath,
+                hasSeparateAudio: hasAudio,
+                audioLanguage: audioInfo?.language,
+                audioTrackName: audioInfo?.name,
+              );
+        log("Remuxer: ${_remuxer.runtimeType}");
+      } else {
+        output = File(finalPath);
+        _out = output.openWrite(mode: task.resumeFrom == 0 ? FileMode.write : FileMode.append);
+      }
+
+      await _loadSubtitles(finalPath);
+
+      // When resuming into a remuxer, it still needs the init segment that was skipped over
+      final skippedInit = video.segments.take(video.nextToWrite).where((s) => s.isInit).lastOrNull;
+      if (skippedInit != null && _remuxer != null) {
+        final bytes = await _fetch(skippedInit, "video init", 0);
+        if (bytes != null) await _write(skippedInit, bytes, isAudio: false);
+      }
+
+      final maxLookahead = task.parallelBatches * 2;
       int lastUpdatedProgress = 0; // Dont notify if progress is same
       int lastDownloadedSegmentIndex = -1;
-
-      final Map<int, _BufferItem> buffers = {};
-      final Map<int, _BufferItem> audioBuffers = {};
-
-      final Set<Future<void>> activeDownloads = {};
-      final Set<Future<void>> activeAudioDownloads = {};
-
-      int currentIndex = task.resumeFrom.toInt();
-      int nextExpectedIndex = task.resumeFrom.toInt();
-      final int totalSegments = segments.length;
-
-      int currentAudioIndex = 0;
-      int nextExpectedAudioIndex = 0;
-      final int totalAudioSegments = audioSegements.length;
-
-      // slot allocation
-      final maxVideoBatch = parallelDownloadsBatchSize;
-      final maxAudioBatch = hasAudio ? 2 : 0;
-      final maxLookahead = maxVideoBatch * 2;
-
       Object? downloadError;
 
-      while (nextExpectedIndex < totalSegments || (hasAudio && nextExpectedAudioIndex < totalAudioSegments)) {
-        if (downloadError != null) {
-          throw downloadError!;
+      // Keep up to [maxParallel] fetches in flight, but never run too far ahead of the writer,
+      // so a single slow segment can't make the buffers grow unbounded.
+      void fill(_Track track) {
+        while (track.active.length < track.maxParallel &&
+            track.nextToFetch < track.segments.length &&
+            (track.nextToFetch - track.nextToWrite) < maxLookahead) {
+          final index = track.nextToFetch++;
+          final future = () async {
+            try {
+              final bytes = await _fetch(track.segments[index], track.label, index);
+              if (bytes != null) track.ready[index] = bytes;
+            } catch (e) {
+              downloadError ??= e;
+            }
+          }();
+          track.active.add(future);
+          future.whenComplete(() => track.active.remove(future));
         }
+      }
+
+      while (!video.isDone || !audio.isDone) {
+        if (downloadError != null) throw downloadError!;
 
         // Handle commands
         if (status == DownloadStatus.cancelled) {
@@ -133,137 +144,35 @@ class StreamDownloader extends BaseDownloader {
           }
         }
 
-        if (hasAudio) {
-          while (activeAudioDownloads.length < maxAudioBatch &&
-              currentAudioIndex < totalAudioSegments &&
-              (currentAudioIndex - nextExpectedAudioIndex) < maxLookahead) {
-            final entryIndex = currentAudioIndex;
-            final entry = audioSegements[currentAudioIndex];
-            currentAudioIndex++;
+        fill(audio);
+        fill(video);
 
-            final future = () async {
-              try {
-                final segment = entry.url;
-                final segmentNumber = entryIndex + 1;
-
-                final uri = segment.startsWith('http') ? segment : "$audioBaseLink/$segment";
-
-                final res = await helper.downloadSegmentWithRetries(
-                  uri,
-                  task.retryAttempts,
-                  customHeaders: task.customHeaders,
-                );
-
-                if (status == DownloadStatus.cancelled) {
-                  return;
-                }
-
-                if (res.statusCode >= 200 && res.statusCode < 300) {
-                  // Decrypt if theres an encryption
-                  final buffer = entry.encryptionKey != null
-                      ? await _decryptSegment(buffer: res.bodyBytes, segment: entry)
-                      : res.bodyBytes;
-                  audioBuffers[entryIndex] = _BufferItem(index: segmentNumber, buffer: buffer);
-                } else {
-                  print("Error for audio segment: $uri, body: ${res.body}, res head: ${res.headers}");
-                  throw Exception("ERR_REQ_FAILED. Got Status: ${res.statusCode} for audio segment: $segmentNumber");
-                }
-              } catch (e) {
-                downloadError = e;
-              }
-            }();
-
-            activeAudioDownloads.add(future);
-            future.whenComplete(() {
-              activeAudioDownloads.remove(future);
-            });
-          }
-        }
-
-        // Limit the window lookahead to avoid unbounded memory usage if a single segment is too slow.
-        // E.g., we allow fetching up to parallelDownloadsBatchSize * 2 segments ahead of the next expected one.
-        // final maxLookahead = parallelDownloadsBatchSize * 2;
-
-        // Fill the video window
-        while (activeDownloads.length < parallelDownloadsBatchSize &&
-            currentIndex < totalSegments &&
-            (currentIndex - nextExpectedIndex) < maxLookahead) {
-          final entryIndex = currentIndex;
-          final entry = segments[currentIndex];
-          currentIndex++;
-
-          final future = () async {
-            try {
-              final segment = entry.url;
-              final segmentNumber = currentIndex + 1;
-
-              final uri = segment.startsWith('http') ? segment : "$streamBaseLink/$segment";
-
-              final res = await helper.downloadSegmentWithRetries(
-                uri,
-                task.retryAttempts,
-                customHeaders: task.customHeaders,
-              );
-
-              if (status == DownloadStatus.cancelled) {
-                return;
-              }
-
-              if (res.statusCode >= 200 && res.statusCode < 300) {
-                // Decrypt if theres an encryption
-                final buffer = entry.encryptionKey != null
-                    ? await _decryptSegment(buffer: res.bodyBytes, segment: entry)
-                    : res.bodyBytes;
-                buffers[entryIndex] = _BufferItem(index: segmentNumber, buffer: buffer);
-              } else {
-                print("Error for segment: $uri, body: ${res.body}, res head: ${res.headers}");
-                throw Exception("ERR_REQ_FAILED. Got Status: ${res.statusCode} for segment: $segmentNumber");
-              }
-            } catch (e) {
-              downloadError = e;
-            }
-          }();
-
-          activeDownloads.add(future);
-          future.whenComplete(() {
-            activeDownloads.remove(future);
-          });
-        }
-
-        // Write sequential completed segments to file
+        // Write completed segments in order, audio first
         bool wroteSomething = false;
 
-        // drain audio buffers first
-        while (audioBuffers.containsKey(nextExpectedAudioIndex)) {
-          if (!task.useMkvRemuxer) {
-            throw Exception("Cannot write audio buffers to file without remuxer enabled.");
-          }
-
-          final b = audioBuffers.remove(nextExpectedAudioIndex)!;
-
-          await remuxed?.processAudioChunk(b.buffer);
-
-          nextExpectedAudioIndex++;
+        while (audio.ready.containsKey(audio.nextToWrite)) {
+          final segment = audio.segments[audio.nextToWrite];
+          final bytes = audio.ready.remove(audio.nextToWrite)!;
+          _logContainerOnce(audio, segment, bytes);
+          await _write(segment, bytes, isAudio: true);
+          audio.nextToWrite++;
           // maybe in future add last downloaded aud segment here
-          // lastDownloadedAudioSegmentIndex = nextExpectedAudioIndex;
           wroteSomething = true;
         }
 
-        // then the video buffers
-        while (buffers.containsKey(nextExpectedIndex)) {
-          final b = buffers.remove(nextExpectedIndex)!;
-
-          task.useMkvRemuxer ? await remuxed?.processVideoChunk(b.buffer) : out?.add(b.buffer);
-
-          nextExpectedIndex++;
-          lastDownloadedSegmentIndex = nextExpectedIndex;
+        while (video.ready.containsKey(video.nextToWrite)) {
+          final segment = video.segments[video.nextToWrite];
+          final bytes = video.ready.remove(video.nextToWrite)!;
+          _logContainerOnce(video, segment, bytes);
+          await _write(segment, bytes, isAudio: false);
+          video.nextToWrite++;
+          lastDownloadedSegmentIndex = video.nextToWrite;
           wroteSomething = true;
         }
 
         if (wroteSomething) {
-          // Update progress
-          final totalUnits = totalSegments + totalAudioSegments;
-          final completedUnits = nextExpectedIndex + nextExpectedAudioIndex;
+          final totalUnits = video.segments.length + audio.segments.length;
+          final completedUnits = video.nextToWrite + audio.nextToWrite;
           final progress = totalUnits > 0 ? ((completedUnits / totalUnits) * 100).toInt() : 0;
           if (progress > lastUpdatedProgress && (progress - lastUpdatedProgress >= 2 || progress == 100)) {
             updateProgress(progress, finalPath);
@@ -271,14 +180,12 @@ class StreamDownloader extends BaseDownloader {
           }
         }
 
-        if (downloadError != null) {
-          throw downloadError!;
-        }
+        if (downloadError != null) throw downloadError!;
 
         // Wait for at least one download to complete if we didn't write anything and downloads are active
         if (!wroteSomething) {
-          if (activeDownloads.isNotEmpty || activeAudioDownloads.isNotEmpty) {
-            final allActive = [...activeDownloads, ...activeAudioDownloads];
+          final allActive = [...video.active, ...audio.active];
+          if (allActive.isNotEmpty) {
             await Future.any(allActive.map((f) => f.catchError((_) {})));
           } else {
             await Future.delayed(const Duration(milliseconds: 30));
@@ -288,16 +195,16 @@ class StreamDownloader extends BaseDownloader {
 
       // send the completion/cancelled notification
       if (status.isCancelled) {
-        await out?.close();
+        await _out?.close();
         await output?.delete();
-        await remuxed?.close();
+        await _remuxer?.close();
 
         super.setCancelledStatus();
       } else if (status.isPaused) {
       } // do nothing!
       else {
-        await out?.close();
-        await remuxed?.close();
+        await _out?.close();
+        await _remuxer?.close();
         super.setCompletedStatus(finalPath);
       }
 
@@ -305,12 +212,116 @@ class StreamDownloader extends BaseDownloader {
     } catch (err) {
       // pack the bags and get out!
       print(err);
-      await remuxed?.close();
-      await out?.close();
+      await _remuxer?.close();
+      await _out?.close();
       if (await output?.exists() ?? false) await output?.delete();
 
       //send download failed notification
       setFailedStatus(err.toString());
+    }
+  }
+
+  /// Downloads and prepares (decrypts etc.) a segment. Returns null if the download got cancelled meanwhile.
+  Future<Uint8List?> _fetch(MediaSegment segment, String label, int index) async {
+    final res = await helper.downloadSegmentWithRetries(
+      segment.url,
+      task.retryAttempts,
+      cancel: cancelSignal,
+      customHeaders: {
+        ...task.customHeaders,
+        if (segment.byteRange != null) 'Range': rangeHeaderValue(segment.byteRange!),
+      },
+    );
+
+    if (status == DownloadStatus.cancelled) return null;
+
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      print("Error for $label segment: ${segment.url}, body: ${res.body}, res head: ${res.headers}");
+      throw Exception("ERR_REQ_FAILED. Got Status: ${res.statusCode} for $label segment: ${index + 1}");
+    }
+
+    return segment.prepare(res.bodyBytes, headers: task.customHeaders);
+  }
+
+  /// Summary of a track from its segment list, e.g. "412 segments, fMP4 (init + .m4s)".
+  String _describeTrack(List<MediaSegment> segments) {
+    final media = segments.where((s) => !s.isInit);
+    final ext = _extensionOf(media.firstOrNull?.url);
+    final hasInit = segments.any((s) => s.isInit);
+    final ranged = media.any((s) => s.byteRange != null);
+    final kind = hasInit ? "fMP4 (init + $ext)" : ext;
+    return "${media.length} segments, $kind${ranged ? ", byte-ranged" : ""}";
+  }
+
+  /// Logs what the first media segment of a track actually contains, judged from its bytes.
+  /// URL extensions are unreliable: plenty of CDNs serve TS segments as .jpg/.png/.html.
+  void _logContainerOnce(_Track track, MediaSegment segment, Uint8List bytes) {
+    if (track.containerLogged || segment.isInit) return;
+    track.containerLogged = true;
+    log("${track.label} segments contain: ${_sniffContainer(bytes)} (url says ${_extensionOf(segment.url)})");
+  }
+
+  static String _sniffContainer(Uint8List b) {
+    // MPEG-TS: 0x47 sync byte every 188 bytes
+    if (b.isNotEmpty && b[0] == 0x47 && (b.length < 189 || b[188] == 0x47)) return "MPEG-TS";
+    // ISO BMFF: [size:4][type:4], media fragments start with styp/moof (sidx/ftyp also seen)
+    if (b.length >= 8) {
+      final type = String.fromCharCodes(b.sublist(4, 8));
+      if (const {'styp', 'moof', 'sidx', 'ftyp', 'emsg', 'prft'}.contains(type))
+        return "fMP4 (m4s, starts with '$type')";
+    }
+    // ADTS AAC: 12-bit 0xFFF sync word
+    if (b.length >= 2 && b[0] == 0xFF && (b[1] & 0xF6) == 0xF0) return "raw AAC (ADTS)";
+    if (b.length >= 3 && b[0] == 0x49 && b[1] == 0x44 && b[2] == 0x33) return "ID3-prefixed (likely raw AAC/TS)";
+    final head = b.take(8).map((x) => x.toRadixString(16).padLeft(2, '0')).join(' ');
+    return "unknown (first bytes: $head)";
+  }
+
+  static String _extensionOf(String? url) {
+    if (url == null) return "none";
+    final path = Uri.tryParse(url)?.path ?? url;
+    final last = path.split('/').last;
+    return last.contains('.') ? ".${last.split('.').last.toLowerCase()}" : "no extension";
+  }
+
+  /// Routes a segment to the remuxer (init vs media, audio vs video) or straight to the output file.
+  Future<void> _write(MediaSegment segment, Uint8List bytes, {required bool isAudio}) async {
+    final remuxer = _remuxer;
+
+    // Without a remuxer, init + fragments concatenated is itself a valid (fragmented) mp4
+    if (remuxer == null) {
+      _out?.add(bytes);
+      return;
+    }
+
+    if (segment.isInit) {
+      if (remuxer is M4sToMkvRemuxer) {
+        isAudio ? await remuxer.processAudioInit(bytes) : await remuxer.processVideoInit(bytes);
+      }
+      return;
+    }
+
+    isAudio ? await remuxer.processAudioChunk(bytes) : await remuxer.processVideoChunk(bytes);
+  }
+
+  Future<void> _loadSubtitles(String finalPath) async {
+    if (task.subsUrl == null || task.subsUrl!.isEmpty) return;
+
+    final downloadedSubsPath = await downloadSubs(task.subsUrl!, task.fileName, finalPath);
+    if (!task.writeSubtitleTrackToVideo || _remuxer == null) return;
+
+    final ext = downloadedSubsPath.split(".").lastOrNull?.toLowerCase();
+    if (ext == "srt" || ext == "vtt") {
+      await _remuxer!.loadSubtitles(downloadedSubsPath);
+    } else {
+      task.sendPort?.send(
+        DownloadMessage(
+          status: 'error',
+          id: task.id,
+          message: "Cannot write subtitles to the video file. Only SRT and VTT subtitles are supported by the remuxer.",
+          extras: ["No stack trace needed btw... maybe.. the extension we got is: '$ext'"],
+        ),
+      );
     }
   }
 
@@ -329,50 +340,30 @@ class StreamDownloader extends BaseDownloader {
     }
   }
 
-  Future<Uint8List> _decryptSegment({required Uint8List buffer, required HlsSegment segment}) async {
-    try {
-      // fetch the key, and cache it for future use
-      final keyUri = segment.encryptionKey!.uri;
-      Uint8List? keyBytes = _encryptionKeyCache[keyUri];
-
-      if (keyBytes == null) {
-        final res = await get(Uri.parse(keyUri), headers: task.customHeaders);
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          keyBytes = res.bodyBytes;
-          _encryptionKeyCache[keyUri] = keyBytes;
-        } else {
-          throw Exception("Failed to fetch encryption key from $keyUri. Status code: ${res.statusCode}");
-        }
-      }
-
-      Uint8List ivBytes;
-      if (segment.encryptionKey!.iv != null) {
-        // Parse explicit IV from hex string (e.g., "0x00000000000000000000000000000001")
-        final hexString = segment.encryptionKey!.iv!.replaceAll('0x', '').padLeft(32, '0');
-        ivBytes = Uint8List.fromList(
-          List.generate(16, (i) => int.parse(hexString.substring(i * 2, i * 2 + 2), radix: 16)),
-        );
-      } else {
-        // Fallback: 16-byte big-endian integer of the sequence number
-        ivBytes = Uint8List(16);
-        final byteData = ByteData.view(ivBytes.buffer);
-        byteData.setUint64(8, segment.sequenceNumber, Endian.big); // Writes to the last 8 bytes
-      }
-
-      final encrypt = Encrypter(AES(Key(keyBytes), mode: AESMode.cbc));
-      final decryptedBuffer = encrypt.decryptBytes(Encrypted(buffer), iv: IV(ivBytes));
-      return Uint8List.fromList(decryptedBuffer);
-    } catch (err) {
-      print("COULDNT DECRYPT A SEGMENT, KILLING THE DOWNLOAD");
-      print(err.toString());
-      rethrow;
-    }
-  }
-
   @override
   Future<void> onCancel() async {
     return; // nothing to do
   }
 }
 
-class _BufferItem({required final int index, required final Uint8List buffer});
+/// Download/write bookkeeping for one track's segments.
+class _Track {
+  final String label;
+  final List<MediaSegment> segments;
+  final int maxParallel;
+
+  /// Downloaded segments waiting to be written in order, by index
+  final Map<int, Uint8List> ready = {};
+  final Set<Future<void>> active = {};
+
+  int nextToFetch;
+  int nextToWrite;
+
+  bool containerLogged = false;
+
+  _Track(this.label, this.segments, {required this.maxParallel, int startAt = 0})
+    : nextToFetch = startAt,
+      nextToWrite = startAt;
+
+  bool get isDone => nextToWrite >= segments.length;
+}

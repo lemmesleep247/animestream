@@ -156,6 +156,7 @@ class MkvMuxer {
   /// Opens the MKV container with explicit audio and subtitle track configurations.
   Future<void> openWithTracks({
     List<int>? avcc,
+    String videoCodecId = 'V_MPEG4/ISO/AVC', // 'V_MPEGH/ISO/HEVC' with an hvcC in [avcc]
     int videoTrackNumber = 1,
     int? videoTrackUid,
     String? videoTrackName,
@@ -217,7 +218,7 @@ class MkvMuxer {
         ...Ebml.writeUint(0x73C5, videoTrackUid ?? videoTrackNumber),
         ...Ebml.writeUint(0x83, 1), // TrackType Video
         ...Ebml.writeUint(0x88, 1), // FlagDefault = 1
-        ...Ebml.writeString(0x86, 'V_MPEG4/ISO/AVC'),
+        ...Ebml.writeString(0x86, videoCodecId),
       ];
 
       if (videoTrackName != null && videoTrackName.isNotEmpty) {

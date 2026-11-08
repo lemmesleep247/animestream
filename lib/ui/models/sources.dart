@@ -21,7 +21,7 @@ class SourceManager {
 
   static final _undownloadableSources = [
     //uses mpd which needs ffmpeg to download (makes the app bulky :< )
-    "animeonsen",
+    // "animeonsen",
   ];
 
   final List<ProviderDetails> inbuiltSources = [

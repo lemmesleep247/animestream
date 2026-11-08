@@ -1,9 +1,17 @@
+import 'package:animestream/core/commons/streams/streamRef.dart';
+
 class AudioStream {
   final String language;
   final String url;
   final String name;
   final String channels;
   final String groupId;
+  final int? bandwidth;
+
+  final StreamRef? _ref;
+
+  /// Where this track's segments come from. Defaults to treating [url] as a HLS media playlist.
+  StreamRef get ref => _ref ?? HlsRef(url);
 
   const AudioStream({
     required this.groupId,
@@ -11,7 +19,9 @@ class AudioStream {
     required this.url,
     required this.language,
     required this.channels,
-  });
+    this.bandwidth,
+    StreamRef? ref,
+  }) : _ref = ref;
 
   factory AudioStream.placeholder() {
     return AudioStream(
@@ -33,7 +43,7 @@ class AudioStream {
 
   @override
   String toString() {
-    return 'AudioStream(language: $language, url: $url, name: $name, channels: $channels, groupId: $groupId)';
+    return 'AudioStream(language: $language, url: $url, name: $name, channels: $channels, groupId: $groupId, ref: $ref)';
   }
 }
 

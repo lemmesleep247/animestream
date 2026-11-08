@@ -5,9 +5,8 @@ import 'package:animestream/core/anime/providers/models.dart';
 import 'package:animestream/core/app/logging.dart';
 import 'package:animestream/core/app/runtimeDatas.dart';
 import 'package:animestream/core/commons/hlsParser/audioStream.dart';
-import 'package:animestream/core/commons/hlsParser/hlsMasterPlaylist.dart';
-import 'package:animestream/core/commons/hlsParser/hlsParser.dart';
 import 'package:animestream/core/commons/hlsParser/qualityStream.dart';
+import 'package:animestream/core/commons/streams/streamResolver.dart';
 import 'package:animestream/core/data/watching.dart';
 import 'package:animestream/core/commons/enums.dart';
 import 'package:animestream/ui/models/playerControllers/betterPlayer.dart';
@@ -121,8 +120,8 @@ class ServerSelectionBottomSheetState extends State<ServerSelectionBottomSheet> 
               }
               if (widget.type == ServerSheetType.download) {
                 list.forEach((element) async {
-                  // auto or multi quality would mean multiple qualities
-                  if (element.quality == "multi-quality" || element.quality == "auto") {
+                  // HLS master playlists and DASH manifests expand into multiple qualities
+                  if (StreamResolver.isExpandable(element)) {
                     await getQualities(element);
                   } else {
                     qualities.add(
@@ -148,29 +147,24 @@ class ServerSelectionBottomSheetState extends State<ServerSelectionBottomSheet> 
   }
 
   Future<void> getQualities(VideoStream source) async {
-    List<DownloadStreamOptions> mainList = [];
+    final resolved = await StreamResolver.resolve(source).catchError((e) {
+      Logs.app.log("${source.server}: $e");
+      return ResolvedStreams.empty;
+    });
 
-    final HlsMasterPlaylist list = await HlsParser.parseMasterPlaylist(source.url, customHeader: source.customHeaders)
-        .catchError((e) {
-          Logs.app.log("${source.server}: $e");
-          return HlsMasterPlaylist(audioStreams: [], qualityStreams: []);
-        });
+    final subtitleUrl = (source.subtitle?.isNotEmpty ?? false) ? source.subtitle : resolved.subtitleUrl;
 
-    list.qualityStreams.forEach((element) {
-      final downloadStream = DownloadStreamOptions(
-        videoStream: element,
-        audioStreams: list.audioStreams,
+    final options = resolved.videos.map(
+      (video) => DownloadStreamOptions(
+        videoStream: video,
+        audioStreams: resolved.audios,
         server: "${source.server} ${source.backup ? "- backup" : ""}",
-        subtitleUrl: source.subtitle,
+        subtitleUrl: subtitleUrl,
         headers: source.customHeaders ?? {},
-      );
-      mainList.add(downloadStream);
-    });
-    // if (mounted)
-    setState(() {
-      //     _isLoading = false;
-      qualities = qualities + mainList;
-    });
+      ),
+    );
+
+    if (mounted) setState(() => qualities = qualities + options.toList());
   }
 
   @override

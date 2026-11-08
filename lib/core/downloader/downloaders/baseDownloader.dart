@@ -51,13 +51,22 @@ abstract class BaseDownloader {
     _timer = t;
   }
 
+  final _cancelSignal = Completer<void>();
+
+  @nonVirtual
+  Future<void> get cancelSignal => _cancelSignal.future;
+
   @nonVirtual
   void setPausedStatus(int progress, int resumeFrom, String filepath) {
     _status = DownloadStatus.paused;
-    task.sendPort?.send(DownloadMessage(
-      status: 'paused', id: task.id, message: "Paused at $progress%",
-      extras: [resumeFrom, filepath], // Just pass which segment index it should resume from!
-    ));
+    task.sendPort?.send(
+      DownloadMessage(
+        status: 'paused',
+        id: task.id,
+        message: "Paused at $progress%",
+        extras: [resumeFrom, filepath], // Just pass which segment index it should resume from!
+      ),
+    );
   }
 
   @nonVirtual
@@ -67,10 +76,17 @@ abstract class BaseDownloader {
   }
 
   @nonVirtual
-  void setCompletedStatus(String finalPath, { bool silent = false}) {
+  void setCompletedStatus(String finalPath, {bool silent = false}) {
     _status = DownloadStatus.completed;
-    task.sendPort?.send(DownloadMessage(
-        status: 'complete', id: task.id, extras: [task.fileName, finalPath], message: "Download complete.", silent: false));
+    task.sendPort?.send(
+      DownloadMessage(
+        status: 'complete',
+        id: task.id,
+        extras: [task.fileName, finalPath],
+        message: "Download complete.",
+        silent: false,
+      ),
+    );
   }
 
   @nonVirtual
@@ -79,10 +95,18 @@ abstract class BaseDownloader {
     task.sendPort?.send(DownloadMessage(status: 'fail', id: task.id, message: message));
   }
 
+  /// Sends a line to the main isolate's downloader log (isolates can't write the log files themselves).
+  @nonVirtual
+  void log(String message) {
+    // print("[DOWNLOADER]<${task.id}> $message");
+    task.sendPort?.send(DownloadMessage(status: 'log', id: task.id, message: message));
+  }
+
   @nonVirtual
   void updateProgress(int progress, String finalPath) {
     task.sendPort?.send(
-        DownloadMessage(status: 'progress', id: task.id, progress: progress, extras: [task.fileName, finalPath]));
+      DownloadMessage(status: 'progress', id: task.id, progress: progress, extras: [task.fileName, finalPath]),
+    );
   }
 
   /// Set up the isolate ports for communicating with main thread.
@@ -100,6 +124,7 @@ abstract class BaseDownloader {
           case 'cancel':
             {
               onCancel();
+              if (!_cancelSignal.isCompleted) _cancelSignal.complete();
               if (_status == DownloadStatus.paused) {
                 final file = File(await helper.makeDirectory(fileName: task.fileName, downloadPath: task.downloadPath));
                 if (await file.exists()) await file.delete();

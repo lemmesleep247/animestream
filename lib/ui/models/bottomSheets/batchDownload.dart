@@ -6,9 +6,8 @@ import 'package:animestream/core/anime/providers/models.dart';
 import 'package:animestream/core/app/logging.dart';
 import 'package:animestream/core/app/runtimeDatas.dart';
 import 'package:animestream/core/commons/hlsParser/audioStream.dart';
-import 'package:animestream/core/commons/hlsParser/hlsMasterPlaylist.dart';
-import 'package:animestream/core/commons/hlsParser/hlsParser.dart';
 import 'package:animestream/core/commons/hlsParser/qualityStream.dart';
+import 'package:animestream/core/commons/streams/streamResolver.dart';
 import 'package:animestream/ui/models/providers/infoProvider.dart';
 import 'package:animestream/ui/models/snackBar.dart';
 import 'package:animestream/ui/models/sources.dart';
@@ -155,37 +154,34 @@ class _BatchDownloadSheetContentState extends State<BatchDownloadSheetContent> {
         VideoStream? selectedVideoStream;
         QualityStream? selectedQualityStream;
         List<AudioStream> selectedAudioStreams = const [];
+        String? resolvedSubtitleUrl;
 
-        final multiQualityStream = candidateStreams.firstWhereOrNull(
-          (s) => s.quality == "multi-quality" || s.quality == "auto",
-        );
+        final multiQualityStream = candidateStreams.firstWhereOrNull(StreamResolver.isExpandable);
 
         if (multiQualityStream != null) {
           try {
-            final HlsMasterPlaylist playlist = await HlsParser.parseMasterPlaylist(
-              multiQualityStream.url,
-              customHeader: multiQualityStream.customHeaders,
-            );
+            final resolved = await StreamResolver.resolve(multiQualityStream);
 
-            if (playlist.qualityStreams.isNotEmpty) {
+            if (resolved.videos.isNotEmpty) {
               final targetQuality =
-                  playlist.qualityStreams.firstWhereOrNull(
+                  resolved.videos.firstWhereOrNull(
                     (q) => q.quality.toLowerCase().contains(preferredQuality.toLowerCase()),
                   ) ??
-                  playlist.qualityStreams.first;
+                  resolved.videos.first;
 
               selectedVideoStream = multiQualityStream;
               selectedQualityStream = targetQuality;
+              resolvedSubtitleUrl = resolved.subtitleUrl;
 
-              if (playlist.audioStreams.isNotEmpty) {
+              if (resolved.audios.isNotEmpty) {
                 final chosenAudio =
-                    playlist.audioStreams.firstWhereOrNull((a) => dubPreference ? a.isEnglish : !a.isEnglish) ??
-                    playlist.audioStreams.first;
+                    resolved.audios.firstWhereOrNull((a) => dubPreference ? a.isEnglish : !a.isEnglish) ??
+                    resolved.audios.first;
                 selectedAudioStreams = [chosenAudio];
               }
             }
           } catch (e) {
-            Logs.downloader.log("[BATCH] Master playlist parse error for ep ${index + 1}: $e");
+            Logs.downloader.log("[BATCH] Stream resolve error for ep ${index + 1}: $e");
           }
         }
 
@@ -203,7 +199,10 @@ class _BatchDownloadSheetContentState extends State<BatchDownloadSheetContent> {
           );
         }
 
-        final subtitleUrl = includeSubs ? selectedVideoStream?.subtitle : null;
+        final providerSubs = selectedVideoStream?.subtitle;
+        final subtitleUrl = includeSubs
+            ? ((providerSubs?.isNotEmpty ?? false) ? providerSubs : resolvedSubtitleUrl)
+            : null;
 
         await DownloadManager().addDownloadTask(
           selectedQualityStream.url,

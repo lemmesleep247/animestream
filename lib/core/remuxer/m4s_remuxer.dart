@@ -83,6 +83,15 @@ class M4sToMkvRemuxer extends BaseMkvRemuxer {
     final canOpen = videoTrack != null && (!hasSeparateAudio || audioTrack != null);
 
     if (canOpen) {
+      // Without the decoder config the muxer would silently drop the video TrackEntry
+      // while still writing its blocks, producing an audio-only file.
+      if (videoTrack.codecPrivate == null) {
+        throw Exception("fMP4 init segment has no avcC/hvcC for video track (codec: ${videoTrack.codec})");
+      }
+      if (audioTrack != null && audioTrack.codecPrivate == null) {
+        throw Exception("fMP4 init segment has no AudioSpecificConfig for audio track (codec: ${audioTrack.codec})");
+      }
+
       final audioTracks = <MkvAudioTrack>[];
       if (audioTrack != null) {
         audioTracks.add(
@@ -111,6 +120,7 @@ class M4sToMkvRemuxer extends BaseMkvRemuxer {
 
       await muxer.openWithTracks(
         avcc: videoTrack.codecPrivate,
+        videoCodecId: videoTrack.isHevc ? 'V_MPEGH/ISO/HEVC' : 'V_MPEG4/ISO/AVC',
         audioTracks: audioTracks,
         subtitleTracks: subtitleTracks,
         width: videoTrack.width ?? 1920,
@@ -157,6 +167,7 @@ class M4sToMkvRemuxer extends BaseMkvRemuxer {
 
       await muxer.openWithTracks(
         avcc: videoTrack?.codecPrivate,
+        videoCodecId: (videoTrack?.isHevc ?? false) ? 'V_MPEGH/ISO/HEVC' : 'V_MPEG4/ISO/AVC',
         audioTracks: audioTracks,
         subtitleTracks: subtitleTracks,
         width: videoTrack?.width ?? 1920,

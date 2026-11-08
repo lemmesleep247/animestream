@@ -4,6 +4,7 @@ import 'package:animestream/core/commons/dashParser/dashManifest.dart';
 import 'package:animestream/core/commons/dashParser/dashSegment.dart';
 import 'package:animestream/core/commons/hlsParser/audioStream.dart';
 import 'package:animestream/core/commons/hlsParser/qualityStream.dart';
+import 'package:animestream/core/commons/streams/streamRef.dart';
 import 'package:animestream/core/network/network.dart';
 import 'package:xml/xml.dart';
 
@@ -31,16 +32,18 @@ class DashParser {
   }
 
   /// Parses a DASH MPD manifest URL into a [DashManifest]
+  ///
+  /// Pass `useCache: false` when calling from an isolate, where the app's cache storage isn't initialised.
   static Future<DashManifest> parseManifest(
     String manifestUrl, {
     Map<String, String>? customHeader,
+    bool useCache = true,
   }) async {
     final baseUri = Uri.parse(manifestUrl);
-
     final res = await get(
       baseUri,
       headers: customHeader,
-      cacheDuration: const Duration(hours: 1),
+      cacheDuration: useCache ? const Duration(hours: 1) : null,
     );
 
     if (res.statusCode < 200 || res.statusCode >= 300) {
@@ -142,23 +145,32 @@ class DashParser {
 
           rawRepresentations.add(dashRep);
 
-          // Map into AnimeStream standard stream models for compatibility
+          // DRM'd media can't be decrypted by us, so don't offer it as a stream
+          final isProtected = _findDirectChild(adaptationSet, 'ContentProtection') != null ||
+              _findDirectChild(rep, 'ContentProtection') != null;
+          if (isProtected) continue;
+
+          // the ref is what identifies the actual track.
+          final ref = DashRef(manifestUrl, id);
           if (contentType == 'video') {
             qualityStreams.add(QualityStream(
               quality: dashRep.qualityString,
-              url: repBaseUri.toString(),
+              url: manifestUrl,
               resolution: dashRep.resolutionString,
               bandwidth: bandwidth > 0 ? bandwidth : null,
               audioGroup: adaptationSet.getAttribute('group') ?? 'audio',
+              ref: ref,
             ));
           } else if (contentType == 'audio') {
             final channels = adaptationSet.getAttribute('audioChannelConfiguration') ?? '2';
             audioStreams.add(AudioStream(
               groupId: adaptationSet.getAttribute('group') ?? 'audio',
               name: lang == 'und' ? 'Audio ($id)' : lang.toUpperCase(),
-              url: repBaseUri.toString(),
+              url: manifestUrl,
               language: lang,
               channels: channels,
+              bandwidth: bandwidth > 0 ? bandwidth : null,
+              ref: ref,
             ));
           } else if (contentType == 'text') {
             subtitleStreams.add(DashSubtitleStream(

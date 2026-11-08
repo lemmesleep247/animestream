@@ -254,10 +254,9 @@ class HTTP {
   void close() {}
 
   bool _shouldCache(Duration? cacheDuration) {
-    if (_cache != null && !_cache.cacheConfig.enableCaching) {
-      return false;
-    }
-    return cacheDuration != null && cacheDuration > Duration.zero;
+    // Check the duration first: reading the config touches Hive, which isn't available in isolates
+    if (cacheDuration == null || cacheDuration <= Duration.zero) return false;
+    return _cache != null && _cache.cacheConfig.enableCaching;
   }
 }
 

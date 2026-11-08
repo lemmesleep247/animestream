@@ -30,11 +30,21 @@ class M4sTrackInfo {
     this.codecPrivate,
   });
 
+  bool get isHevc => codec == 'hvc1' || codec == 'hev1';
+
   @override
   String toString() {
     return 'M4sTrackInfo(id: $trackId, codec: $codec, video: $isVideo, timescale: $timescale, '
-        'res: ${width}x$height, audio: ${channels}ch@${sampleRate}Hz)';
+        'res: ${width}x$height, audio: ${channels}ch@${sampleRate}Hz, codecPrivate: ${codecPrivate?.length ?? 0}B)';
   }
+}
+
+/// Per-track sample defaults from `moov/mvex/trex`, used when `tfhd` doesn't override them.
+class _TrexDefaults {
+  final int duration;
+  final int size;
+  final int flags;
+  const _TrexDefaults(this.duration, this.size, this.flags);
 }
 
 /// A parsed audio or video sample from an `.m4s` media segment (`moof` + `mdat`).
@@ -80,6 +90,7 @@ class M4sSample {
 /// Demuxer for fragmented MP4 (fMP4 / `.m4s`) streams used by MPEG-DASH and HLS fMP4.
 class M4sDemuxer {
   final Map<int, M4sTrackInfo> _tracks = {};
+  final Map<int, _TrexDefaults> _trex = {};
 
   /// All tracks discovered from initialization segments (`moov`).
   Map<int, M4sTrackInfo> get tracks => Map.unmodifiable(_tracks);
@@ -105,6 +116,17 @@ class M4sDemuxer {
       if (info != null) {
         _tracks[info.trackId] = info;
         discovered.add(info);
+      }
+    }
+
+    // Fragment sample defaults (many packagers only put them here, not in tfhd)
+    final mvex = _findBox(initBytes, moovBox.payloadOffset, moovBox.payloadEnd, 'mvex');
+    if (mvex != null) {
+      for (final trex in _findAllBoxes(initBytes, mvex.payloadOffset, mvex.payloadEnd, 'trex')) {
+        if (trex.payloadLength < 24) continue;
+        final bd = ByteData.sublistView(initBytes, trex.payloadOffset, trex.payloadEnd);
+        // version/flags(4) track_ID(4) default_sample_description_index(4) duration(4) size(4) flags(4)
+        _trex[bd.getUint32(4)] = _TrexDefaults(bd.getUint32(12), bd.getUint32(16), bd.getUint32(20));
       }
     }
 
@@ -170,7 +192,8 @@ class M4sDemuxer {
       trackId = version == 1 ? bd.getUint32(20) : bd.getUint32(12);
 
       // Width & height are 16.16 fixed point numbers at the end of tkhd
-      final widthOffset = version == 1 ? 84 : 72;
+      // (v0: 4 ver/flags + 20 times/id/duration + 8 reserved + 8 layer..volume + 36 matrix = 76; v1 adds 12)
+      final widthOffset = version == 1 ? 88 : 76;
       if (widthOffset + 8 <= tkhd.payloadLength) {
         width = bd.getUint32(widthOffset) >> 16;
         height = bd.getUint32(widthOffset + 4) >> 16;
@@ -213,38 +236,46 @@ class M4sDemuxer {
           if (sampleEntry != null) {
             codec = sampleEntry.type;
 
+            final bd = ByteData.sublistView(bytes, sampleEntry.payloadOffset, sampleEntry.payloadEnd);
+
             if (isVideo) {
-              // avc1 / hvc1 sample entry
-              if (sampleEntry.payloadLength >= 32) {
-                final bd = ByteData.sublistView(bytes, sampleEntry.payloadOffset, sampleEntry.payloadEnd);
+              // VisualSampleEntry: 78 bytes of fixed fields, then child boxes (avcC/hvcC/pasp/...)
+              // reserved(6) data_ref_index(2) pre_defined/reserved(16) width(2)@24 height(2)@26 ...
+              if (sampleEntry.payloadLength >= 28) {
                 width = bd.getUint16(24);
                 height = bd.getUint16(26);
               }
 
-              // Extract avcC / hvcC configuration record
-              final avcC = _findBox(bytes, sampleEntry.payloadOffset, sampleEntry.payloadEnd, 'avcC');
-              if (avcC != null) {
-                codecPrivate = bytes.sublist(avcC.payloadOffset, avcC.payloadEnd);
-              } else {
-                final hvcC = _findBox(bytes, sampleEntry.payloadOffset, sampleEntry.payloadEnd, 'hvcC');
-                if (hvcC != null) {
-                  codecPrivate = bytes.sublist(hvcC.payloadOffset, hvcC.payloadEnd);
-                }
+              final childStart = sampleEntry.payloadOffset + 78;
+              final config = _findBox(bytes, childStart, sampleEntry.payloadEnd, 'avcC') ??
+                  _findBox(bytes, childStart, sampleEntry.payloadEnd, 'hvcC');
+              if (config != null) {
+                codecPrivate = bytes.sublist(config.payloadOffset, config.payloadEnd);
               }
             } else if (isAudio) {
-              // mp4a sample entry
+              // AudioSampleEntry: reserved(6) data_ref_index(2) version(2)@8 revision(2) vendor(4)
+              // channelcount(2)@16 samplesize(2)@18 pre_defined(2)@20 reserved(2)@22 samplerate(16.16)@24
+              // then child boxes at 28. QuickTime sound description v1/v2 add 16/36 more bytes.
+              int childOffset = 28;
               if (sampleEntry.payloadLength >= 28) {
-                final bd = ByteData.sublistView(bytes, sampleEntry.payloadOffset, sampleEntry.payloadEnd);
+                final soundVersion = bd.getUint16(8);
                 channels = bd.getUint16(16);
-                sampleRate = (bd.getUint32(22) >> 16).toDouble();
+                sampleRate = (bd.getUint32(24) >> 16).toDouble();
+                childOffset += soundVersion == 1 ? 16 : (soundVersion == 2 ? 36 : 0);
               }
 
-              // Extract AudioSpecificConfig from esds box
-              final esds = _findBox(bytes, sampleEntry.payloadOffset, sampleEntry.payloadEnd, 'esds');
+              final esds = _findBox(bytes, sampleEntry.payloadOffset + childOffset, sampleEntry.payloadEnd, 'esds');
               if (esds != null) {
                 codecPrivate = _extractAudioSpecificConfigFromEsds(
                   bytes.sublist(esds.payloadOffset, esds.payloadEnd),
                 );
+              }
+
+              // The AudioSpecificConfig is authoritative (the entry's fields are often 0 or capped at 16 bits)
+              final asc = codecPrivate != null ? _parseAudioSpecificConfig(codecPrivate) : null;
+              if (asc != null) {
+                if (asc.sampleRate > 0) sampleRate = asc.sampleRate.toDouble();
+                if (asc.channels > 0) channels = asc.channels;
               }
             }
           }
@@ -281,11 +312,13 @@ class M4sDemuxer {
     final tfhdFlags = bdTfhd.getUint32(0) & 0x00FFFFFF;
     final trackId = bdTfhd.getUint32(4);
 
+    // Start from the init segment's trex defaults; tfhd overrides them when present
+    final trex = _trex[trackId];
     int tfhdCursor = 8;
     int? baseDataOffset;
-    int? defaultSampleDuration;
-    int? defaultSampleSize;
-    int? defaultSampleFlags;
+    int? defaultSampleDuration = trex?.duration;
+    int? defaultSampleSize = trex?.size;
+    int? defaultSampleFlags = trex?.flags;
 
     if ((tfhdFlags & 0x000001) != 0 && tfhdCursor + 8 <= tfhd.payloadLength) {
       baseDataOffset = bdTfhd.getUint64(tfhdCursor);
@@ -317,6 +350,8 @@ class M4sDemuxer {
     final trackInfo = _tracks[trackId];
     final timescale = trackInfo?.timescale ?? 90000;
     final isVideo = trackInfo?.isVideo ?? true;
+    final isHevc = trackInfo?.isHevc ?? false;
+    final nalLengthSize = _nalLengthSize(trackInfo);
 
     final results = <M4sSample>[];
     final trunBoxes = _findAllBoxes(bytes, trafStart, trafEnd, 'trun');
@@ -379,19 +414,13 @@ class M4sDemuxer {
 
           // Keyframe determination:
           // 1. In audio, all samples are keyframes.
-          // 2. In video, sample_is_non_sync_sample flag (0x00010000) == 0 means keyframe.
-          // 3. Fallback: inspect first NALU header for IDR slice (type 5).
+          // 2. In video, trust explicit sample flags (sample_is_non_sync_sample == 0 means sync).
+          // 3. No flags at all: scan the NALs, the IDR is rarely the first one (AUD/SEI/SPS come first).
           bool isKeyframe = !isVideo;
           if (isVideo) {
-            if ((flags & 0x00010000) == 0 && flags != 0) {
-              isKeyframe = true;
-            } else if (samplePayload.length > 4) {
-              // Read NAL unit type (AVCC length prefix is 4 bytes)
-              final nalType = samplePayload[4] & 0x1F;
-              if (nalType == 5 || nalType == 7) {
-                isKeyframe = true;
-              }
-            }
+            isKeyframe = flags != 0
+                ? (flags & 0x00010000) == 0
+                : _containsIdr(samplePayload, isHevc: isHevc, lengthSize: nalLengthSize);
           }
 
           // Scale timestamps to standard 90kHz
@@ -419,6 +448,66 @@ class M4sDemuxer {
     return results;
   }
 
+  /// NAL length prefix size from the decoder config: `avcC[4] & 3` / `hvcC[21] & 3`, plus one. Usually 4.
+  static int _nalLengthSize(M4sTrackInfo? track) {
+    final config = track?.codecPrivate;
+    if (config == null) return 4;
+    if (track!.isHevc) return config.length > 21 ? (config[21] & 0x03) + 1 : 4;
+    return config.length > 4 ? (config[4] & 0x03) + 1 : 4;
+  }
+
+  /// Whether a length-prefixed sample contains an IDR/IRAP picture.
+  static bool _containsIdr(Uint8List sample, {required bool isHevc, required int lengthSize}) {
+    int offset = 0;
+    while (offset + lengthSize < sample.length) {
+      int nalLength = 0;
+      for (int i = 0; i < lengthSize; i++) {
+        nalLength = (nalLength << 8) | sample[offset + i];
+      }
+      final nalStart = offset + lengthSize;
+      if (nalLength <= 0 || nalStart + nalLength > sample.length) return false;
+
+      if (isHevc) {
+        // IRAP pictures: BLA (16-18), IDR (19-20), CRA (21)
+        final type = (sample[nalStart] >> 1) & 0x3F;
+        if (type >= 16 && type <= 21) return true;
+      } else {
+        if ((sample[nalStart] & 0x1F) == 5) return true; // IDR slice
+      }
+      offset = nalStart + nalLength;
+    }
+    return false;
+  }
+
+  static const _aacSampleRates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+  /// Reads sample rate and channel count from an AAC `AudioSpecificConfig` (ISO 14496-3 1.6.2.1).
+  static ({int sampleRate, int channels})? _parseAudioSpecificConfig(Uint8List asc) {
+    if (asc.length < 2) return null;
+    int bitPos = 0;
+    int readBits(int n) {
+      int value = 0;
+      for (int i = 0; i < n; i++) {
+        final byte = bitPos >> 3;
+        if (byte >= asc.length) return value;
+        value = (value << 1) | ((asc[byte] >> (7 - (bitPos & 7))) & 1);
+        bitPos++;
+      }
+      return value;
+    }
+
+    final objectType = readBits(5);
+    if (objectType == 31) readBits(6); // escape: 32 + 6 more bits
+
+    final freqIndex = readBits(4);
+    final sampleRate = freqIndex == 15
+        ? readBits(24)
+        : (freqIndex < _aacSampleRates.length ? _aacSampleRates[freqIndex] : 0);
+    final channelConfig = readBits(4);
+
+    return (sampleRate: sampleRate, channels: channelConfig == 7 ? 8 : channelConfig);
+  }
+
   /// Parses MPEG-4 elementary stream descriptor (`esds`) to locate the `AudioSpecificConfig`.
   static Uint8List? _extractAudioSpecificConfigFromEsds(Uint8List esdsData) {
     if (esdsData.length < 5) return null;
@@ -440,8 +529,13 @@ class M4sDemuxer {
       final length = readTagLength();
 
       if (tag == 0x03) {
-        // ES_Descriptor
-        offset += 3; // skip ES_ID (2) + streamPriority (1)
+        // ES_Descriptor: ES_ID(2) + flags(1), then optional fields depending on the flags
+        if (offset + 3 > esdsData.length) break;
+        final esFlags = esdsData[offset + 2];
+        offset += 3;
+        if ((esFlags & 0x80) != 0) offset += 2; // dependsOn_ES_ID
+        if ((esFlags & 0x40) != 0 && offset < esdsData.length) offset += 1 + esdsData[offset]; // URL
+        if ((esFlags & 0x20) != 0) offset += 2; // OCR_ES_Id
       } else if (tag == 0x04) {
         // DecoderConfigDescriptor
         offset += 13; // skip objectType (1) + streamType (1) + bufferSize (3) + bitrates (8)

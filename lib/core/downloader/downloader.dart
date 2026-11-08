@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:animestream/core/commons/hlsParser/hlsParser.dart';
+import 'package:animestream/core/commons/streams/streamRef.dart';
 import 'package:collection/collection.dart';
 
 import 'package:animestream/core/downloader/downloadManager.dart';
@@ -109,7 +110,14 @@ class Downloader {
 
       final task = _cookTask(item, path);
 
-      logger?.log('Queuing task $task with type: ${type.name}');
+      final ext = _helper.extractExtension(item.url);
+      final kind = switch (type) {
+        _DownloadType.stream => item.videoStream?.ref is DashRef ? "stream: DASH" : "stream: HLS",
+        _DownloadType.video => "direct file: ${ext != null ? ".$ext" : "(detected by mime type)"}",
+        _DownloadType.image => "image",
+        _DownloadType.mock => "mock",
+      };
+      logger?.log('Queuing task $task as $kind');
 
       // Run the downloading
       final isolate = await Isolate.spawn(downloadFunction, task);
@@ -150,6 +158,7 @@ class Downloader {
     // hmm thinking of doing this, but since cancellation is requested
     // and not really cancelled, should it be set as cancelled? (nvm lets wing it)
     DownloadManager.downloadingItems.firstWhereOrNull((it) => it.id == id)?.status = DownloadStatus.cancelled;
+    DownloadManager.dequeue(id); // why not?
   }
 
   Future<void> requestPause(int id) async {
@@ -293,6 +302,10 @@ class Downloader {
         logger?.log("<${msg.id}> Isolate timed out. Nuking the isolate.");
         break;
 
+      case 'log':
+        logger?.log("<${msg.id}> ${msg.message}");
+        break;
+
       default:
         {
           throw Exception("What the f*ck is ${msg.status} supposed to mean? (Unknown status exception)");
@@ -356,6 +369,10 @@ class Downloader {
 
   Future<_DownloadType> _getDownloadType(DownloadItem item) async {
     if (item.mock) return _DownloadType.mock;
+    // DASH tracks all share the manifest URL, so the ref is the only reliable signal
+    if (item.videoStream?.ref is DashRef)  {
+      return _DownloadType.stream;
+    }
     final ext = _helper.extractExtension(item.url);
     final videoExtensions = ['mp4', 'mkv', 'avi', 'webm', 'flv'];
     final streamExtensions = ['m3u8', 'm3u'];

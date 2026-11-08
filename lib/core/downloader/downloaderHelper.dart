@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
@@ -6,10 +7,11 @@ import 'package:animestream/core/app/runtimeDatas.dart';
 import 'package:animestream/ui/models/notification.dart';
 import 'package:animestream/ui/models/snackBar.dart';
 import 'package:device_info_plus/device_info_plus.dart';
-import 'package:encrypt/encrypt.dart';
-import 'package:http/http.dart';
+import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+
+class SegmentCancelledException implements Exception {}
 
 class DownloaderHelper {
   static final _idSet = <int>{};
@@ -73,8 +75,12 @@ class DownloaderHelper {
   }
 
   /// Make the directory for the file
-  Future<String> makeDirectory(
-      {required String fileName, required downloadPath, bool isImage = false, String? fileExtension = null}) async {
+  Future<String> makeDirectory({
+    required String fileName,
+    required downloadPath,
+    bool isImage = false,
+    String? fileExtension = null,
+  }) async {
     final basePath = downloadPath;
 
     final downPath = await Directory(basePath);
@@ -99,43 +105,78 @@ class DownloaderHelper {
     return finalPath;
   }
 
-  //The enc key [im assuming AES for animepahe cus thats the only use case for this in this app rn]
-  Uint8List? encryptionKey = null;
+  final _client = http.Client();
 
-  //download the segment
-  Future<Response> downloadSegment(String url, {Map<String, String> customHeaders = const {}}) async {
+  /// Thrown when the download was cancelled on purpose; never retried.
+
+  /// Downloads a segment. It's aborted if no bytes arrive for [idleTimeout], or when [cancel] completes.
+  Future<http.Response> downloadSegment(
+    String url, {
+    Map<String, String> customHeaders = const {},
+    Duration idleTimeout = const Duration(seconds: 10),
+    Future<void>? cancel,
+  }) async {
+    final abort = Completer<void>();
+    bool cancelled = false;
+    void triggerAbort() {
+      if (!abort.isCompleted) abort.complete();
+    }
+
+    cancel?.then((_) {
+      cancelled = true;
+      triggerAbort();
+    });
+
+    Timer? idle;
+    void resetIdle() {
+      idle?.cancel();
+      idle = Timer(idleTimeout, triggerAbort);
+    }
+
+    final request = http.AbortableRequest('GET', Uri.parse(url), abortTrigger: abort.future)
+      ..headers.addAll(customHeaders);
+
     try {
-      final res = await get(Uri.parse(url), headers: customHeaders);
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        return res;
+      resetIdle(); // covers connecting + waiting for headers
+      final streamed = await _client.send(request);
+
+      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+        triggerAbort(); // don't bother downloading the error body
+        throw http.ClientException("Segment download failed with status ${streamed.statusCode}", request.url);
       }
-      throw Exception("Segment download failed with status code ${res.statusCode}");
-    } catch (err) {
-      throw Exception("Failed to download segment: $err");
+
+      final body = BytesBuilder(copy: false);
+      await for (final chunk in streamed.stream) {
+        resetIdle(); // still receiving data, so keep going however long it takes in total
+        body.add(chunk);
+      }
+      return http.Response.bytes(body.takeBytes(), streamed.statusCode, headers: streamed.headers, request: request);
+    } on http.RequestAbortedException {
+      if (cancelled) throw SegmentCancelledException();
+      throw TimeoutException("No data for ${idleTimeout.inSeconds}s", idleTimeout);
+    } finally {
+      idle?.cancel();
     }
   }
 
-  Uint8List decryptSegment(Uint8List buffer) {
-    try {
-      final encrypt = Encrypter(AES(Key(encryptionKey!), mode: AESMode.cbc));
-      final decryptedBuffer = encrypt.decryptBytes(Encrypted(buffer), iv: IV.fromLength(16));
-      return Uint8List.fromList(decryptedBuffer);
-    } catch (err) {
-      print("COULDNT DECRYPT A SEGMENT, KILLING THE DOWNLOAD");
-      print(err.toString());
-      rethrow;
-    }
-  }
-
-  Future<Response> downloadSegmentWithRetries(String url, int totalAttempts,
-      {Map<String, String> customHeaders = const {}}) async {
+  Future<http.Response> downloadSegmentWithRetries(
+    String url,
+    int totalAttempts, {
+    Map<String, String> customHeaders = const {},
+    Future<void>? cancel,
+  }) async {
     int currentAttempt = 0;
     while (currentAttempt < totalAttempts) {
       try {
         currentAttempt++;
-        final res = await downloadSegment(url, customHeaders: customHeaders)
-            .timeout(Duration(seconds: 10), onTimeout: () => throw Exception("FAILED DOWNLOAD ATTEMPT"));
+        final res = await downloadSegment(
+          url,
+          customHeaders: customHeaders,
+          cancel: cancel,
+        );
         return res;
+      } on SegmentCancelledException {
+        rethrow;
       } catch (err) {
         if (currentAttempt >= totalAttempts) {
           throw Exception("NUMBER OF DOWNLOAD ATTEMPTS EXCEEDED, KILLING THE DOWNLOAD.");
@@ -145,44 +186,6 @@ class DownloaderHelper {
       }
     }
     throw Exception("THIS SHOULD'NT BE THROWN");
-  }
-
-  Future<List<String>> getSegments(String url, {Map<String, String> customHeaders = const {}}) async {
-    final List<String> segments = [];
-    final res = await get(Uri.parse(url), headers: customHeaders);
-    final lines = res.body.split('\n');
-    for (final line in lines) {
-      if (!line.startsWith("#")) {
-        if (line.contains("EXT")) continue;
-
-        // feels weird, but adding cus a server used ts
-        if (line.endsWith(".m3u8")) {
-          return await getSegments(line.startsWith("http") ? line : makeBaseLink(url) + "/$line",
-              customHeaders: customHeaders);
-        }
-
-        // if (line.isNotEmpty) {
-          segments.add(line.trim());
-        // }
-      } else {
-        //get the encryption key if it exists
-        if (encryptionKey == null && line.startsWith("#EXT-X-KEY:METHOD=")) {
-          final regex = RegExp(r'#EXT-X-KEY:METHOD=([^"]+),URI="([^"]+)"');
-          final match = regex.firstMatch(line);
-          if (match != null) {
-            if (match.group(1) == null || match.group(2) == null) {
-              print("[DOWNLOADER] COULDNT GET THE ENCRYPTION TYPE OR THE KEY");
-              continue;
-            }
-            print("[DOWNLOADER] Found encryption: ${match.group(1)}");
-            String keyLink = match.group(2)!;
-            keyLink = keyLink.startsWith("http") ? keyLink : makeBaseLink(url) + "/$keyLink";
-            encryptionKey = (await get(Uri.parse(keyLink), headers: customHeaders)).bodyBytes;
-          }
-        }
-      }
-    }
-    return segments;
   }
 
   String makeBaseLink(String uri) {
@@ -231,12 +234,20 @@ class DownloaderHelper {
 
   void sendProgressNotif(int id, int progress, String fileName, String downloadPath) {
     _notifierService.updateNotificationProgressBar(
-        id: id, currentStep: progress, maxStep: 100, fileName: fileName, path: downloadPath);
+      id: id,
+      currentStep: progress,
+      maxStep: 100,
+      fileName: fileName,
+      path: downloadPath,
+    );
   }
 
   void sendCancelledNotif(int id, {bool failed = false}) {
-    _notifierService.pushBasicNotification(id, "Download ${failed ? 'Failed' : 'Cancelled'}",
-        "Download ${failed ? "failed due to an error. Check logs for details" : "was cancelled"}");
+    _notifierService.pushBasicNotification(
+      id,
+      "Download ${failed ? 'Failed' : 'Cancelled'}",
+      "Download ${failed ? "failed due to an error. Check logs for details" : "was cancelled"}",
+    );
   }
 
   void sendCompletedNotif(int id, String fileName, String downloadPath) {

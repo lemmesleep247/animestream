@@ -251,17 +251,25 @@ class PlayerDataProvider extends ChangeNotifier {
   }
 
   Future<void> updatePresence() async {
-    await discord?.updatePresence(
-      DiscordPresence(
-        type: DiscordActivityType.watching,
-        details: "$showTitle",
-        statusDisplayType: DiscordStatusDisplayType.details,
-        state: "Episode ${_state.currentEpIndex + 1}",
-        largeAsset: DiscordAsset.fromUrl(coverImageUrl),
-        smallAsset: DiscordAsset.fromKey("app_icon"),
-        timestamps: DiscordTimestamps(start: DateTime.now().millisecondsSinceEpoch ~/ 1000),
-      ),
-    );
+    final cover = coverImageUrl;
+    final hasCover = cover != null && cover.isNotEmpty;
+
+    try {
+      await discord?.updatePresence(
+        DiscordPresence(
+          type: DiscordActivityType.watching,
+          details: "$showTitle",
+          statusDisplayType: DiscordStatusDisplayType.details,
+          state: "Episode ${_state.currentEpIndex + 1}",
+          largeAsset: hasCover ? DiscordAsset.fromUrl(cover) : DiscordAsset.fromKey("app_icon"),
+          smallAsset: hasCover ? DiscordAsset.fromKey("app_icon") : null,
+          timestamps: DiscordTimestamps(start: DateTime.now().millisecondsSinceEpoch ~/ 1000),
+        ),
+      );
+    } catch (e) {
+      // Presence is cosmetic, never let it break playback
+      Logs.app.log("Discord presence update failed: $e");
+    }
   }
 
   Future<void> stopRPC() async {

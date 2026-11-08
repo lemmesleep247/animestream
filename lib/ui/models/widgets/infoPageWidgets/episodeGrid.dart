@@ -9,11 +9,7 @@ import 'package:flutter/material.dart';
 class InfoPageEpisodeGrid extends StatelessWidget {
   final Size size;
   final InfoProvider provider;
-  const InfoPageEpisodeGrid({
-    super.key,
-    required this.provider,
-    required this.size,
-  });
+  const InfoPageEpisodeGrid({super.key, required this.provider, required this.size});
 
   @override
   Widget build(BuildContext context) {
@@ -30,10 +26,7 @@ class InfoPageEpisodeGrid extends StatelessWidget {
       itemBuilder: (context, index) {
         final ValueNotifier<bool> hovered = ValueNotifier<bool>(false);
         return Container(
-          decoration: BoxDecoration(
-            color: appTheme.backgroundColor,
-            borderRadius: BorderRadius.circular(15),
-          ),
+          decoration: BoxDecoration(color: appTheme.backgroundColor, borderRadius: BorderRadius.circular(15)),
           child: GestureDetector(
             onTap: () {
               provider.selectedEpisodeToLoadStreams = index + (provider.currentPageIndex * 24);
@@ -80,31 +73,36 @@ class InfoPageEpisodeGrid extends StatelessWidget {
     return ContextMenu(
       menuItems: [
         ContextMenuItem(
-            icon: Icons.play_arrow_rounded,
-            label: "Watch",
-            onClick: () {
-              provider.selectedEpisodeToLoadStreams = index;
-              showDialog(
-                context: context,
-                useRootNavigator: false,
-                builder: (context) {
-                  return Dialog(
-                    backgroundColor: appTheme.backgroundColor,
-                    child: Container(
-                      padding: EdgeInsets.all(20),
-                      width: size.width / 3,
-                      child: ServerSelectionBottomSheet(
-                        provider: provider,
-                        episodeIndex: index,
-                        type: ServerSheetType.watch,
-                      ),
+          icon: Icons.play_arrow_rounded,
+          label: "Watch",
+          onClick: () {
+            provider.selectedEpisodeToLoadStreams = index;
+            showDialog(
+              context: context,
+              useRootNavigator: false,
+              builder: (context) {
+                return Dialog(
+                  backgroundColor: appTheme.backgroundColor,
+                  child: Container(
+                    padding: EdgeInsets.all(20),
+                    width: size.width / 3,
+                    child: ServerSelectionBottomSheet(
+                      provider: provider,
+                      episodeIndex: index,
+                      type: ServerSheetType.watch,
                     ),
-                  );
-                },
-              );
-            }),
-        ContextMenuItem(
-            icon: Icons.download, label: "Download", onClick: () => _showDownloadDialog(context, provider, index))
+                  ),
+                );
+              },
+            );
+          },
+        ),
+        if (provider.selectedSource.supportDownloads)
+          ContextMenuItem(
+            icon: Icons.download,
+            label: "Download",
+            onClick: () => _showDownloadDialog(context, provider, index),
+          ),
       ],
       child: Container(
         margin: EdgeInsets.all(5),
@@ -116,11 +114,7 @@ class InfoPageEpisodeGrid extends StatelessWidget {
         ),
         child: Text(
           "$episodeNumber",
-          style: TextStyle(
-            fontSize: 16,
-            fontWeight: FontWeight.bold,
-            color: appTheme.textMainColor,
-          ),
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: appTheme.textMainColor),
         ),
       ),
     );
@@ -151,13 +145,10 @@ class InfoPageEpisodeGrid extends StatelessWidget {
                 ),
               ),
               AnimatedOpacity(
-                  duration: Duration(milliseconds: 100),
-                  opacity: hovered.value ? 1 : 0,
-                  child: Icon(
-                    Icons.play_circle_fill_rounded,
-                    size: 35,
-                    color: appTheme.textMainColor,
-                  ))
+                duration: Duration(milliseconds: 100),
+                opacity: hovered.value ? 1 : 0,
+                child: Icon(Icons.play_circle_fill_rounded, size: 35, color: appTheme.textMainColor),
+              ),
             ],
           ),
           Container(
@@ -167,24 +158,19 @@ class InfoPageEpisodeGrid extends StatelessWidget {
               children: [
                 Text(
                   "EP $episodeNumber",
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                    color: appTheme.textMainColor,
-                  ),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: appTheme.textMainColor),
                 ),
-                IconButton(
-                  onPressed: () {
-                    _showDownloadDialog(context, provider, index);
-                  },
-                  icon: Icon(Icons.download_rounded, color: Colors.white),
-                  style: ButtonStyle(
-                    backgroundColor: WidgetStatePropertyAll(Colors.black.withAlpha(180)),
-                    shape: WidgetStatePropertyAll(
-                      RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                if (provider.selectedSource.supportDownloads)
+                  IconButton(
+                    onPressed: () {
+                      _showDownloadDialog(context, provider, index);
+                    },
+                    icon: Icon(Icons.download_rounded, color: Colors.white),
+                    style: ButtonStyle(
+                      backgroundColor: WidgetStatePropertyAll(Colors.black.withAlpha(180)),
+                      shape: WidgetStatePropertyAll(RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
                     ),
                   ),
-                ),
               ],
             ),
           ),
@@ -240,10 +226,7 @@ class InfoPageEpisodeGrid extends StatelessWidget {
                 gradient: LinearGradient(
                   begin: Alignment.topCenter,
                   end: Alignment.bottomCenter,
-                  colors: [
-                    Colors.transparent,
-                    Colors.black.withAlpha(179),
-                  ],
+                  colors: [Colors.transparent, Colors.black.withAlpha(179)],
                 ),
               ),
             ),
@@ -257,28 +240,19 @@ class InfoPageEpisodeGrid extends StatelessWidget {
               children: [
                 Text(
                   title,
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.w600,
-                    color: Colors.white,
-                  ),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600, color: Colors.white),
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                 ),
                 if (isFiller)
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
-                    child: Text(
-                      'Filler',
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: appTheme.accentColor,
-                      ),
-                    ),
+                    child: Text('Filler', style: TextStyle(fontSize: 12, color: appTheme.accentColor)),
                   ),
               ],
             ),
           ),
+          if (provider.selectedSource.supportDownloads)
           Positioned(
             bottom: 10,
             right: 10,
@@ -289,9 +263,7 @@ class InfoPageEpisodeGrid extends StatelessWidget {
               icon: Icon(Icons.download_rounded, color: Colors.white),
               style: ButtonStyle(
                 backgroundColor: WidgetStatePropertyAll(Colors.black.withAlpha(150)),
-                shape: WidgetStatePropertyAll(
-                  RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-                ),
+                shape: WidgetStatePropertyAll(RoundedRectangleBorder(borderRadius: BorderRadius.circular(8))),
               ),
               tooltip: 'Download',
             ),
@@ -299,13 +271,7 @@ class InfoPageEpisodeGrid extends StatelessWidget {
           AnimatedOpacity(
             duration: Duration(milliseconds: 120),
             opacity: hovered.value ? 1 : 0,
-            child: Center(
-              child: Icon(
-                Icons.play_circle_fill_rounded,
-                size: 52,
-                color: Colors.white.withAlpha(204),
-              ),
-            ),
+            child: Center(child: Icon(Icons.play_circle_fill_rounded, size: 52, color: Colors.white.withAlpha(204))),
           ),
         ],
       ),

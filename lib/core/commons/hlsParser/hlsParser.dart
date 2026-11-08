@@ -129,8 +129,6 @@ class HlsParser {
     final res = await http.get(baseUri, headers: customHeaders);
     final lines = res.body.split('\n');
 
-    String? initUrl;
-
     int sequenceNumber = 0;
     double duration = 0.0;
     HlsEncryptionKey? currentKey;
@@ -153,6 +151,20 @@ class HlsParser {
           if (uri != null) {
             currentKey = HlsEncryptionKey(method: method, uri: baseUri.resolve(uri).toString(), iv: iv);
           }
+        }
+      } else if (line.startsWith('#EXT-X-MAP:')) {
+        // fMP4 init segment (ftyp + moov). Byte-ranged maps aren't supported yet.
+        final uri = _parseAttributes(line.substring(11))['URI'];
+        if (uri != null) {
+          segments.add(
+            HlsSegment(
+              url: baseUri.resolve(uri).toString(),
+              duration: 0,
+              sequenceNumber: sequenceNumber,
+              encryptionKey: currentKey,
+              isInit: true,
+            ),
+          );
         }
       } else if (line.startsWith('#EXTINF:')) {
         duration = double.tryParse(line.substring(8).split(',')[0]) ?? 0.0;

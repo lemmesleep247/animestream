@@ -85,22 +85,6 @@ void main(List<String> args) async {
 
     HttpOverrides.global = _HttpOverrides();
 
-    // await dotenv.load(fileName: ".env");
-
-    // if (currentUserSettings?.enableDiscordPresence ?? false) {
-    //   await FlutterDiscordRPC.initialize("1362858832266657812");
-    // }
-
-    // FlutterError.onError = (FlutterErrorDetails details) async {
-    //   FlutterError.presentError(details);
-
-    //   // force add these error to logs
-    //   Logs.app.log(details.exceptionAsString() + "\n${details.stack.toString()}", addToBuffer: true);
-    //   await Logs.writeAllLogs();
-
-    //   print("[ERROR] logged the error to logs folder");
-    // };
-
     runApp(
       ChangeNotifierProvider(
         create: (context) => AppProvider(),
